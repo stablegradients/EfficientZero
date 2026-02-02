@@ -54,7 +54,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     scaler: Any
         scaler for torch amp
     vis_result: bool
-        True -> log some visualization data in tensorboard (some distributions, values, etc)
+        True -> log some visualization data (some distributions, values, etc)
     """
     inputs_batch, targets_batch = batch
     obs_batch_ori, action_batch, mask_batch, indices, weights_lst, make_time = inputs_batch
@@ -135,6 +135,13 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     value_prefix_loss = torch.zeros(batch_size, device=config.device)
     consistency_loss = torch.zeros(batch_size, device=config.device)
 
+    # Entropy accumulators
+    with torch.no_grad():
+        pred_probs_init = torch.softmax(policy_logits, dim=1)
+        policy_entropy_sum = -(pred_probs_init * torch.log(pred_probs_init + 1e-8)).sum(dim=1)
+        target_entropy_sum = -(target_policy[:, 0] * torch.log(target_policy[:, 0] + 1e-8)).sum(dim=1)
+        entropy_count = 1
+
     target_value_prefix_cpu = target_value_prefix.detach().cpu()
     gradient_scale = 1 / config.num_unroll_steps
     # loss of the unrolled steps
@@ -165,6 +172,13 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
                 value_prefix_loss += config.scalar_reward_loss(value_prefix, target_value_prefix_phi[:, step_i]) * mask_batch[:, step_i]
                 # Follow MuZero, set half gradient
                 hidden_state.register_hook(lambda grad: grad * 0.5)
+
+                # accumulate entropy
+                with torch.no_grad():
+                    pred_probs = torch.softmax(policy_logits, dim=1)
+                    policy_entropy_sum += -(pred_probs * torch.log(pred_probs + 1e-8)).sum(dim=1) * mask_batch[:, step_i]
+                    target_entropy_sum += -(target_policy[:, step_i + 1] * torch.log(target_policy[:, step_i + 1] + 1e-8)).sum(dim=1) * mask_batch[:, step_i]
+                    entropy_count += 1
 
                 # reset hidden states
                 if (step_i + 1) % config.lstm_horizon_len == 0:
@@ -221,6 +235,13 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
             # Follow MuZero, set half gradient
             hidden_state.register_hook(lambda grad: grad * 0.5)
 
+            # accumulate entropy
+            with torch.no_grad():
+                pred_probs = torch.softmax(policy_logits, dim=1)
+                policy_entropy_sum += -(pred_probs * torch.log(pred_probs + 1e-8)).sum(dim=1) * mask_batch[:, step_i]
+                target_entropy_sum += -(target_policy[:, step_i + 1] * torch.log(target_policy[:, step_i + 1] + 1e-8)).sum(dim=1) * mask_batch[:, step_i]
+                entropy_count += 1
+
             # reset hidden states
             if (step_i + 1) % config.lstm_horizon_len == 0:
                 reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(config.device),
@@ -251,6 +272,10 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
                 if value_prefix_indices_0.any():
                     other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0], target_value_prefix_base[value_prefix_indices_0])
     # ----------------------------------------------------------------------------------
+    # compute mean entropy across unroll steps and batch
+    mean_policy_entropy = (policy_entropy_sum / entropy_count).mean().item()
+    mean_target_entropy = (target_entropy_sum / entropy_count).mean().item()
+    # ----------------------------------------------------------------------------------
     # weighted loss with masks (some invalid states which are out of trajectory.)
     loss = (config.consistency_coeff * consistency_loss + config.policy_loss_coeff * policy_loss +
             config.value_loss_coeff * value_loss + config.reward_loss_coeff * value_prefix_loss)
@@ -273,7 +298,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
 
-    torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm)
+    grad_norm = torch.nn.utils.clip_grad_norm_(parameters, config.max_grad_norm)
     if config.amp_type == 'torch_amp':
         scaler.step(optimizer)
         scaler.update()
@@ -286,7 +311,8 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
 
     # packing data for logging
     loss_data = (total_loss.item(), weighted_loss.item(), loss.mean().item(), 0, policy_loss.mean().item(),
-                 value_prefix_loss.mean().item(), value_loss.mean().item(), consistency_loss.mean())
+                 value_prefix_loss.mean().item(), value_loss.mean().item(), consistency_loss.mean(),
+                 grad_norm.item(), mean_policy_entropy, mean_target_entropy)
     if vis_result:
         reward_w_dist, representation_mean, dynamic_mean, reward_mean = model.get_params_mean()
         other_dist['reward_weights_dist'] = reward_w_dist
@@ -324,7 +350,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     return loss_data, td_data, priority_data, scaler
 
 
-def _train(model, target_model, replay_buffer, shared_storage, batch_storage, config, summary_writer):
+def _train(model, target_model, replay_buffer, shared_storage, batch_storage, config):
     """training loop
     Parameters
     ----------
@@ -338,8 +364,6 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
         model storage
     batch_storage: Any
         batch storage (queue)
-    summary_writer: Any
-        logging for tensorboard
     """
     # ----------------------------------------------------------------------------------
     model = model.to(config.device)
@@ -377,10 +401,13 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
             replay_buffer.remove_to_fit.remote()
 
         # obtain a batch
+        t_batch_start = time.time()
         batch = batch_storage.pop()
         if batch is None:
             time.sleep(0.3)
             continue
+        t_batch_wait = time.time() - t_batch_start
+
         shared_storage.incr_counter.remote()
         lr = adjust_lr(config, optimizer, step_count)
 
@@ -398,14 +425,17 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
         else:
             vis_result = False
 
+        t_update_start = time.time()
         if config.amp_type == 'torch_amp':
             log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
             scaler = log_data[3]
         else:
             log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
+        t_update_elapsed = time.time() - t_update_start
 
         if step_count % config.log_interval == 0:
-            _log(config, step_count, log_data[0:3], model, replay_buffer, lr, shared_storage, summary_writer, vis_result)
+            timing_data = {'update_weights_time': t_update_elapsed, 'batch_wait_time': t_batch_wait}
+            _log(config, step_count, log_data[0:3], model, replay_buffer, lr, shared_storage, vis_result, timing_data=timing_data)
 
         # The queue is empty.
         if step_count >= 100 and step_count % 50 == 0 and batch_storage.get_len() == 0:
@@ -423,12 +453,10 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
     return model.get_weights()
 
 
-def train(config, summary_writer, model_path=None):
+def train(config, model_path=None):
     """training process
     Parameters
     ----------
-    summary_writer: Any
-        logging for tensorboard
     model_path: str
         model path for resuming
         default: train from scratch
@@ -465,7 +493,7 @@ def train(config, summary_writer, model_path=None):
     workers += [_test.remote(config, storage)]
 
     # training loop
-    final_weights = _train(model, target_model, replay_buffer, storage, batch_storage, config, summary_writer)
+    final_weights = _train(model, target_model, replay_buffer, storage, batch_storage, config)
 
     ray.wait(workers)
     print('Training over...')

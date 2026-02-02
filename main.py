@@ -5,11 +5,54 @@ import os
 import numpy as np
 import ray
 import torch
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from core.test import test
 from core.train import train
 from core.utils import init_logger, make_results_dir, set_seed
+
+
+def build_wandb_group_name(args):
+    """Build a wandb group name from non-default arguments.
+
+    Format: {env}[_param1=val1_param2=val2...][_suffix]
+
+    - Different seeds share the same group (seed is NOT in the group name).
+    - Only non-default hyperparameters appear in the group name.
+    - The user can append a suffix via --wandb_group_suffix.
+    """
+    parts = [args.env]
+
+    # Argparse defaults to compare against
+    arg_defaults = {
+        'amp_type': 'torch_amp',
+        'cpu_actor': 14,
+        'gpu_actor': 20,
+        'p_mcts_num': 4,
+        'revisit_policy_search_rate': 0.99,
+        'use_root_value': False,
+        'use_priority': False,
+        'use_max_priority': False,
+        'use_augmentation': True,
+        'augmentation': ['shift', 'intensity'],
+        'info': 'none',
+    }
+
+    non_default_params = []
+    for param_name, default_val in sorted(arg_defaults.items()):
+        actual_val = getattr(args, param_name)
+        if actual_val != default_val:
+            non_default_params.append('{}={}'.format(param_name, actual_val))
+
+    if non_default_params:
+        parts.append('_'.join(non_default_params))
+
+    if args.wandb_group_suffix:
+        parts.append(args.wandb_group_suffix)
+
+    return '_'.join(parts)
+
+
 if __name__ == '__main__':
     # Lets gather arguments
     parser = argparse.ArgumentParser(description='EfficientZero')
@@ -54,6 +97,16 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default='./results/test_model.p', help='load model path')
     parser.add_argument('--object_store_memory', type=int, default=150 * 1024 * 1024 * 1024, help='object store memory')
 
+    # Wandb arguments
+    parser.add_argument('--wandb_entity', type=str, default='stablegradients',
+                        help='Wandb entity (default: %(default)s)')
+    parser.add_argument('--wandb_project', type=str, default='MonteCarloTreeSearch',
+                        help='Wandb project name (default: %(default)s)')
+    parser.add_argument('--wandb_group_suffix', type=str, default='',
+                        help='Additional string to append to the wandb group name')
+    parser.add_argument('--wandb_offline', action='store_true', default=False,
+                        help='Run wandb in offline mode (default: %(default)s)')
+
     # Process arguments
     args = parser.parse_args()
     args.device = 'cuda' if (not args.no_cuda) and torch.cuda.is_available() else 'cpu'
@@ -87,12 +140,28 @@ if __name__ == '__main__':
     device = game_config.device
     try:
         if args.opr == 'train':
-            summary_writer = SummaryWriter(exp_path, flush_secs=10)
+            # Initialize wandb
+            group_name = build_wandb_group_name(args)
+            run_name = '{}_seed={}'.format(group_name, args.seed)
+
+            if args.wandb_offline:
+                os.environ['WANDB_MODE'] = 'offline'
+
+            wandb.init(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                group=group_name,
+                name=run_name,
+                config=game_config.get_hparams(),
+                dir=exp_path,
+                reinit=True,
+            )
+
             if args.load_model and os.path.exists(args.model_path):
                 model_path = args.model_path
             else:
                 model_path = None
-            model, weights = train(game_config, summary_writer, model_path)
+            model, weights = train(game_config, model_path)
             model.set_weights(weights)
             total_steps = game_config.training_steps + game_config.last_steps
             test_score, _, test_path = test(game_config, model.to(device), total_steps, game_config.test_episodes, device, render=False, save_video=args.save_video, final_test=True, use_pb=True)
@@ -103,14 +172,15 @@ if __name__ == '__main__':
                 'mean_score': mean_score,
                 'std_score': std_score,
             }
-            for key, val in test_log.items():
-                summary_writer.add_scalar('train/{}'.format(key), np.mean(val), total_steps)
+            wandb.log({'train/{}'.format(key): np.mean(val) for key, val in test_log.items()}, step=total_steps)
 
             test_msg = '#{:<10} Test Mean Score of {}: {:<10} (max: {:<10}, min:{:<10}, std: {:<10})' \
                        ''.format(total_steps, game_config.env_name, mean_score, test_score.max(), test_score.min(), std_score)
             logging.getLogger('train_test').info(test_msg)
             if args.save_video:
                 logging.getLogger('train_test').info('Saving video in path: {}'.format(test_path))
+
+            wandb.finish()
         elif args.opr == 'test':
             assert args.load_model
             if args.model_path is None:

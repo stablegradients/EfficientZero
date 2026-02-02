@@ -2,15 +2,18 @@ import ray
 import logging
 
 import numpy as np
+import wandb
 
 
 train_logger = logging.getLogger('train')
 test_logger = logging.getLogger('train_test')
 
 
-def _log(config, step_count, log_data, model, replay_buffer, lr, shared_storage, summary_writer, vis_result):
+
+def _log(config, step_count, log_data, model, replay_buffer, lr, shared_storage, vis_result, timing_data=None):
     loss_data, td_data, priority_data = log_data
-    total_loss, weighted_loss, loss, reg_loss, policy_loss, value_prefix_loss, value_loss, consistency_loss = loss_data
+    total_loss, weighted_loss, loss, reg_loss, policy_loss, value_prefix_loss, value_loss, consistency_loss, \
+        grad_norm, policy_entropy, target_policy_entropy = loss_data
     if vis_result:
         new_priority, target_value_prefix, target_value, trans_target_value_prefix, trans_target_value, target_value_prefix_phi, target_value_phi, \
         pred_value_prefix, pred_value, target_policies, predicted_policies, state_lst, other_loss, other_log, other_dist = td_data
@@ -40,95 +43,79 @@ def _log(config, step_count, log_data, model, replay_buffer, lr, shared_storage,
                    ''.format(test_counter, config.env_name, mean_score, max_score, min_score, std_score)
         test_logger.info(test_msg)
 
-    if summary_writer is not None:
-        if config.debug:
-            for name, W in model.named_parameters():
-                summary_writer.add_histogram('after_grad_clip' + '/' + name + '_grad', W.grad.data.cpu().numpy(),
-                                             step_count)
-                summary_writer.add_histogram('network_weights' + '/' + name, W.data.cpu().numpy(), step_count)
-            pass
-        tag = 'Train'
-        if vis_result:
-            summary_writer.add_histogram('{}_replay_data/replay_buffer_priorities'.format(tag),
-                                         priorities,
-                                         step_count)
-            summary_writer.add_histogram('{}_replay_data/batch_weight'.format(tag), batch_weights, step_count)
-            summary_writer.add_histogram('{}_replay_data/batch_indices'.format(tag), batch_indices, step_count)
-            target_value_prefix = target_value_prefix.flatten()
-            pred_value_prefix = pred_value_prefix.flatten()
-            target_value = target_value.flatten()
-            pred_value = pred_value.flatten()
-            new_priority = new_priority.flatten()
+    # Build a single log dict for wandb
+    log_dict = {}
 
-            summary_writer.add_scalar('{}_statistics/new_priority_mean'.format(tag), new_priority.mean(), step_count)
-            summary_writer.add_scalar('{}_statistics/new_priority_std'.format(tag), new_priority.std(), step_count)
+    tag = 'Train'
+    if vis_result:
+        target_value_prefix = target_value_prefix.flatten()
+        pred_value_prefix = pred_value_prefix.flatten()
+        target_value = target_value.flatten()
+        pred_value = pred_value.flatten()
+        new_priority = new_priority.flatten()
 
-            summary_writer.add_scalar('{}_statistics/target_value_prefix_mean'.format(tag), target_value_prefix.mean(), step_count)
-            summary_writer.add_scalar('{}_statistics/target_value_prefix_std'.format(tag), target_value_prefix.std(), step_count)
-            summary_writer.add_scalar('{}_statistics/pre_value_prefix_mean'.format(tag), pred_value_prefix.mean(), step_count)
-            summary_writer.add_scalar('{}_statistics/pre_value_prefix_std'.format(tag), pred_value_prefix.std(), step_count)
+        log_dict['{}_statistics/new_priority_mean'.format(tag)] = new_priority.mean()
+        log_dict['{}_statistics/new_priority_std'.format(tag)] = new_priority.std()
+        log_dict['{}_statistics/target_value_prefix_mean'.format(tag)] = target_value_prefix.mean()
+        log_dict['{}_statistics/target_value_prefix_std'.format(tag)] = target_value_prefix.std()
+        log_dict['{}_statistics/pre_value_prefix_mean'.format(tag)] = pred_value_prefix.mean()
+        log_dict['{}_statistics/pre_value_prefix_std'.format(tag)] = pred_value_prefix.std()
+        log_dict['{}_statistics/target_value_mean'.format(tag)] = target_value.mean()
+        log_dict['{}_statistics/target_value_std'.format(tag)] = target_value.std()
+        log_dict['{}_statistics/pre_value_mean'.format(tag)] = pred_value.mean()
+        log_dict['{}_statistics/pre_value_std'.format(tag)] = pred_value.std()
 
-            summary_writer.add_scalar('{}_statistics/target_value_mean'.format(tag), target_value.mean(), step_count)
-            summary_writer.add_scalar('{}_statistics/target_value_std'.format(tag), target_value.std(), step_count)
-            summary_writer.add_scalar('{}_statistics/pre_value_mean'.format(tag), pred_value.mean(), step_count)
-            summary_writer.add_scalar('{}_statistics/pre_value_std'.format(tag), pred_value.std(), step_count)
+        for key, val in other_loss.items():
+            if val >= 0:
+                log_dict['{}_metric/{}'.format(tag, key)] = val
 
-            summary_writer.add_histogram('{}_data_dist/new_priority'.format(tag), new_priority, step_count)
-            summary_writer.add_histogram('{}_data_dist/target_value_prefix'.format(tag), target_value_prefix - 1e-5, step_count)
-            summary_writer.add_histogram('{}_data_dist/target_value'.format(tag), target_value - 1e-5, step_count)
-            summary_writer.add_histogram('{}_data_dist/transformed_target_value_prefix'.format(tag), trans_target_value_prefix,
-                                         step_count)
-            summary_writer.add_histogram('{}_data_dist/transformed_target_value'.format(tag), trans_target_value,
-                                         step_count)
-            summary_writer.add_histogram('{}_data_dist/pred_value_prefix'.format(tag), pred_value_prefix - 1e-5, step_count)
-            summary_writer.add_histogram('{}_data_dist/pred_value'.format(tag), pred_value - 1e-5, step_count)
-            summary_writer.add_histogram('{}_data_dist/pred_policies'.format(tag), predicted_policies.flatten(),
-                                         step_count)
-            summary_writer.add_histogram('{}_data_dist/target_policies'.format(tag), target_policies.flatten(),
-                                         step_count)
+        for key, val in other_log.items():
+            log_dict['{}_weight/{}'.format(tag, key)] = val
 
-            summary_writer.add_histogram('{}_data_dist/hidden_state'.format(tag), state_lst.flatten(), step_count)
+    # Core training metrics
+    log_dict['{}/total_loss'.format(tag)] = total_loss
+    log_dict['{}/loss'.format(tag)] = loss
+    log_dict['{}/weighted_loss'.format(tag)] = weighted_loss
+    log_dict['{}/reg_loss'.format(tag)] = reg_loss
+    log_dict['{}/policy_loss'.format(tag)] = policy_loss
+    log_dict['{}/value_loss'.format(tag)] = value_loss
+    log_dict['{}/value_prefix_loss'.format(tag)] = value_prefix_loss
+    log_dict['{}/consistency_loss'.format(tag)] = consistency_loss
+    log_dict['{}/episodes_collected'.format(tag)] = replay_episodes_collected
+    log_dict['{}/replay_buffer_len'.format(tag)] = replay_buffer_size
+    log_dict['{}/total_node_num'.format(tag)] = total_num
+    log_dict['{}/lr'.format(tag)] = lr
 
-            for key, val in other_loss.items():
-                if val >= 0:
-                    summary_writer.add_scalar('{}_metric/'.format(tag) + key, val, step_count)
+    # New metrics
+    log_dict['{}/grad_norm'.format(tag)] = grad_norm
+    log_dict['{}/policy_entropy'.format(tag)] = policy_entropy
+    log_dict['{}/target_policy_entropy'.format(tag)] = target_policy_entropy
 
-            for key, val in other_log.items():
-                summary_writer.add_scalar('{}_weight/'.format(tag) + key, val, step_count)
+    # Worker metrics
+    if worker_reward is not None:
+        log_dict['workers/ori_reward'] = worker_ori_reward
+        log_dict['workers/clip_reward'] = worker_reward
+        log_dict['workers/clip_reward_max'] = worker_reward_max
+        log_dict['workers/eps_len'] = worker_eps_len
+        log_dict['workers/eps_len_max'] = worker_eps_len_max
+        log_dict['workers/temperature'] = temperature
+        log_dict['workers/visit_entropy'] = visit_entropy
+        log_dict['workers/priority_self_play'] = priority_self_play
+    # Test metrics
+    if test_dict is not None:
+        for key, val in test_dict.items():
+            log_dict['train/{}'.format(key)] = np.mean(val)
+        log_dict['train/test_counter'] = test_counter
 
-            for key, val in other_dist.items():
-                summary_writer.add_histogram('{}_dist/'.format(tag) + key, val, step_count)
+    # Timing data from main training loop
+    if timing_data is not None:
+        for key, val in timing_data.items():
+            log_dict['timing/{}'.format(key)] = val
 
-        summary_writer.add_scalar('{}/total_loss'.format(tag), total_loss, step_count)
-        summary_writer.add_scalar('{}/loss'.format(tag), loss, step_count)
-        summary_writer.add_scalar('{}/weighted_loss'.format(tag), weighted_loss, step_count)
-        summary_writer.add_scalar('{}/reg_loss'.format(tag), reg_loss, step_count)
-        summary_writer.add_scalar('{}/policy_loss'.format(tag), policy_loss, step_count)
-        summary_writer.add_scalar('{}/value_loss'.format(tag), value_loss, step_count)
-        summary_writer.add_scalar('{}/value_prefix_loss'.format(tag), value_prefix_loss, step_count)
-        summary_writer.add_scalar('{}/consistency_loss'.format(tag), consistency_loss, step_count)
-        summary_writer.add_scalar('{}/episodes_collected'.format(tag), replay_episodes_collected,
-                                  step_count)
-        summary_writer.add_scalar('{}/replay_buffer_len'.format(tag), replay_buffer_size, step_count)
-        summary_writer.add_scalar('{}/total_node_num'.format(tag), total_num, step_count)
-        summary_writer.add_scalar('{}/lr'.format(tag), lr, step_count)
+    # Timing data from workers
+    worker_timing = ray.get(shared_storage.get_worker_timing.remote())
+    if worker_timing:
+        for key, val in worker_timing.items():
+            log_dict['timing/{}'.format(key)] = val
 
-        if worker_reward is not None:
-            summary_writer.add_scalar('workers/ori_reward', worker_ori_reward, step_count)
-            summary_writer.add_scalar('workers/clip_reward', worker_reward, step_count)
-            summary_writer.add_scalar('workers/clip_reward_max', worker_reward_max, step_count)
-            summary_writer.add_scalar('workers/eps_len', worker_eps_len, step_count)
-            summary_writer.add_scalar('workers/eps_len_max', worker_eps_len_max, step_count)
-            summary_writer.add_scalar('workers/temperature', temperature, step_count)
-            summary_writer.add_scalar('workers/visit_entropy', visit_entropy, step_count)
-            summary_writer.add_scalar('workers/priority_self_play', priority_self_play, step_count)
-            for key, val in distributions.items():
-                if len(val) == 0:
-                    continue
-
-                val = np.array(val).flatten()
-                summary_writer.add_histogram('workers/{}'.format(key), val, step_count)
-
-        if test_dict is not None:
-            for key, val in test_dict.items():
-                summary_writer.add_scalar('train/{}'.format(key), np.mean(val), test_counter)
+    wandb.log(log_dict, step=step_count)

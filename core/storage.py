@@ -57,6 +57,12 @@ class SharedStorage(object):
         self.distributions_log = {}
         self.start = False
 
+        # Timing logs for subprocess profiling
+        self.selfplay_time_log = []
+        self.reanalyze_cpu_time_log = []
+        self.reanalyze_gpu_time_log = []
+        self.test_time_log = []
+
     def set_start_signal(self):
         self.start = True
 
@@ -146,3 +152,24 @@ class SharedStorage(object):
             test_counter = None
 
         return ori_reward, reward, reward_max, eps_lengths, eps_lengths_max, test_counter, test_dict, temperature, visit_entropy, priority_self_play, distributions
+
+    def set_worker_timing(self, worker_type, elapsed_time):
+        if worker_type == 'selfplay':
+            self.selfplay_time_log.append(elapsed_time)
+        elif worker_type == 'reanalyze_cpu':
+            self.reanalyze_cpu_time_log.append(elapsed_time)
+        elif worker_type == 'reanalyze_gpu':
+            self.reanalyze_gpu_time_log.append(elapsed_time)
+        elif worker_type == 'test':
+            self.test_time_log.append(elapsed_time)
+
+    def get_worker_timing(self):
+        timing = {}
+        for name, log_list in [('selfplay_mean_time', self.selfplay_time_log),
+                                ('reanalyze_cpu_mean_time', self.reanalyze_cpu_time_log),
+                                ('reanalyze_gpu_mean_time', self.reanalyze_gpu_time_log),
+                                ('test_mean_time', self.test_time_log)]:
+            if len(log_list) > 0:
+                timing[name] = sum(log_list) / len(log_list)
+                log_list.clear()
+        return timing

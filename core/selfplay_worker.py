@@ -122,6 +122,7 @@ class DataWorker(object):
         max_transitions = self.config.total_transitions // self.config.num_actors
         with torch.no_grad():
             while True:
+                episode_start_time = time.time()
                 trained_steps = ray.get(self.storage.get_counter.remote())
                 # training finished
                 if trained_steps >= self.config.training_steps + self.config.last_steps:
@@ -389,3 +390,6 @@ class DataWorker(object):
                                                                 self_play_rewards_max, _temperature.mean(),
                                                                 visit_entropies, 0,
                                                                 other_dist)
+                # report timing
+                episode_elapsed = time.time() - episode_start_time
+                self.storage.set_worker_timing.remote('selfplay', episode_elapsed)
