@@ -112,6 +112,20 @@ class BaseNet(nn.Module):
 
         return NetworkOutput(value, value_prefix, actor_logit, state, reward_hidden)
 
+    def predict_policy(self, hidden_state):
+        """Run only the policy head on hidden states (for subtree distillation).
+        Parameters
+        ----------
+        hidden_state: Tensor
+            GPU tensor of shape (N, C, H, W)
+        Returns
+        -------
+        policy_logits: Tensor
+            shape (N, action_space_size)
+        """
+        policy_logits, _ = self.prediction(hidden_state)
+        return policy_logits
+
     def get_weights(self):
         return {k: v.cpu() for k, v in self.state_dict().items()}
 

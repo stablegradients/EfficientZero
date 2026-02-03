@@ -5,6 +5,7 @@
 #include <math.h>
 #include <vector>
 #include <stack>
+#include <queue>
 #include <stdlib.h>
 #include <time.h>
 #include <cmath>
@@ -56,6 +57,7 @@ namespace tree {
             std::vector<std::vector<int>> get_trajectories();
             std::vector<std::vector<int>> get_distributions();
             std::vector<float> get_values();
+            std::vector<std::vector<std::vector<int>>> get_qualifying_nodes(int min_visits);
 
     };
 

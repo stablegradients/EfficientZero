@@ -58,7 +58,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     """
     inputs_batch, targets_batch = batch
     obs_batch_ori, action_batch, mask_batch, indices, weights_lst, make_time = inputs_batch
-    target_value_prefix, target_value, target_policy = targets_batch
+    target_value_prefix, target_value, target_policy, subtree_data = targets_batch
 
     # [:, 0: config.stacked_observations * 3,:,:]
     # obs_batch_ori is the original observations in a batch
@@ -276,10 +276,64 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     mean_policy_entropy = (policy_entropy_sum / entropy_count).mean().item()
     mean_target_entropy = (target_entropy_sum / entropy_count).mean().item()
     # ----------------------------------------------------------------------------------
+    # Subtree distillation loss
+    # L_subtree = (1/N) * sum_{h} CE(target, predicted)  where N = total qualifying nodes
+    subtree_loss_mean = torch.zeros(1, device=config.device).squeeze()
+    subtree_loss_scalar = 0.0
+    subtree_grad_norm_scalar = 0.0
+    subtree_mean_visits = 0.0
+    subtree_mean_depth = 0.0
+    subtree_num_nodes = 0
+    subtree_pred_entropy = 0.0
+    subtree_target_entropy = 0.0
+    has_subtree = config.subtree_loss_coeff > 0 and subtree_data is not None and subtree_data['num_nodes'] > 0
+
+    if has_subtree:
+        st_hidden = torch.from_numpy(subtree_data['hidden_states']).to(config.device).float()
+        st_targets = torch.from_numpy(subtree_data['target_policies']).to(config.device).float()
+
+        # Run training model's policy head on the subtree hidden states
+        if config.amp_type == 'torch_amp':
+            with autocast():
+                st_policy_logits = model.predict_policy(st_hidden)
+        else:
+            st_policy_logits = model.predict_policy(st_hidden)
+
+        # Cross-entropy: CE(target, predicted) = -sum(target * log_softmax(predicted))
+        st_ce = -(st_targets * torch.log_softmax(st_policy_logits, dim=1)).sum(1)
+        # Average over all qualifying nodes in the batch
+        subtree_loss_mean = st_ce.mean()
+
+        subtree_loss_scalar = subtree_loss_mean.item()
+        subtree_mean_visits = subtree_data['mean_visits']
+        subtree_mean_depth = subtree_data['mean_depth']
+        subtree_num_nodes = subtree_data['num_nodes']
+
+        # Entropies for logging
+        with torch.no_grad():
+            st_probs = torch.softmax(st_policy_logits, dim=1)
+            subtree_pred_entropy = -(st_probs * torch.log(st_probs + 1e-8)).sum(dim=1).mean().item()
+            subtree_target_entropy = -(st_targets * torch.log(st_targets + 1e-8)).sum(dim=1).mean().item()
+
+    # ----------------------------------------------------------------------------------
     # weighted loss with masks (some invalid states which are out of trajectory.)
     loss = (config.consistency_coeff * consistency_loss + config.policy_loss_coeff * policy_loss +
             config.value_loss_coeff * value_loss + config.reward_loss_coeff * value_prefix_loss)
     weighted_loss = (weights * loss).mean()
+    # Add subtree loss as a scalar term (not per-sample PER-weighted)
+    weighted_loss = weighted_loss + config.subtree_loss_coeff * subtree_loss_mean
+
+    # Compute subtree gradient norm before the main backward (requires retain_graph)
+    if has_subtree:
+        subtree_component = config.subtree_loss_coeff * subtree_loss_mean * gradient_scale
+        params_list = list(model.parameters())
+        try:
+            subtree_grads = torch.autograd.grad(subtree_component, params_list, retain_graph=True, allow_unused=True)
+            subtree_grad_norm_scalar = torch.sqrt(
+                sum((g ** 2).sum() for g in subtree_grads if g is not None)
+            ).item()
+        except RuntimeError:
+            subtree_grad_norm_scalar = 0.0
 
     # backward
     parameters = model.parameters()
@@ -312,7 +366,9 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     # packing data for logging
     loss_data = (total_loss.item(), weighted_loss.item(), loss.mean().item(), 0, policy_loss.mean().item(),
                  value_prefix_loss.mean().item(), value_loss.mean().item(), consistency_loss.mean(),
-                 grad_norm.item(), mean_policy_entropy, mean_target_entropy)
+                 grad_norm.item(), mean_policy_entropy, mean_target_entropy,
+                 subtree_loss_scalar, subtree_grad_norm_scalar, subtree_mean_visits, subtree_mean_depth,
+                 subtree_num_nodes, subtree_pred_entropy, subtree_target_entropy)
     if vis_result:
         reward_w_dist, representation_mean, dynamic_mean, reward_mean = model.get_params_mean()
         other_dist['reward_weights_dist'] = reward_w_dist

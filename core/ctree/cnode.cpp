@@ -251,6 +251,50 @@ namespace tree{
         return values;
     }
 
+    std::vector<std::vector<std::vector<int>>> CRoots::get_qualifying_nodes(int min_visits){
+        std::vector<std::vector<std::vector<int>>> result;
+        result.reserve(this->root_num);
+
+        for(int i = 0; i < this->root_num; ++i){
+            std::vector<std::vector<int>> root_result;
+            // BFS traversal of the tree rooted at roots[i]
+            std::queue<std::pair<CNode*, int>> bfs_queue;
+            bfs_queue.push(std::make_pair(&this->roots[i], 0));
+
+            while(!bfs_queue.empty()){
+                CNode* node = bfs_queue.front().first;
+                int depth = bfs_queue.front().second;
+                bfs_queue.pop();
+
+                if(!node->expanded()) continue;
+
+                // Collect data for non-root expanded nodes with sufficient visits
+                if(depth > 0 && node->visit_count >= min_visits){
+                    std::vector<int> node_info;
+                    node_info.push_back(node->hidden_state_index_x);
+                    node_info.push_back(node->hidden_state_index_y);
+                    node_info.push_back(node->visit_count);
+                    node_info.push_back(depth);
+                    // Append children visit count distribution
+                    for(int a = 0; a < node->action_num; ++a){
+                        CNode* child = node->get_child(a);
+                        node_info.push_back(child->visit_count);
+                    }
+                    root_result.push_back(node_info);
+                }
+
+                // Push children for continued traversal
+                for(int a = 0; a < node->action_num; ++a){
+                    CNode* child = node->get_child(a);
+                    bfs_queue.push(std::make_pair(child, depth + 1));
+                }
+            }
+
+            result.push_back(root_result);
+        }
+        return result;
+    }
+
     //*********************************************************
 
     void update_tree_q(CNode* root, tools::CMinMaxStats &min_max_stats, float discount){

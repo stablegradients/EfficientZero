@@ -60,6 +60,7 @@ cdef extern from "cnode.h" namespace "tree":
         vector[vector[int]] get_trajectories()
         vector[vector[int]] get_distributions()
         vector[float] get_values()
+        vector[vector[vector[int]]] get_qualifying_nodes(int min_visits)
 
     cdef cppclass CSearchResults:
         CSearchResults() except +

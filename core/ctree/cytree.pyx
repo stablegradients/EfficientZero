@@ -61,6 +61,9 @@ cdef class Roots:
     def get_values(self):
         return self.roots[0].get_values()
 
+    def get_qualifying_nodes(self, int min_visits):
+        return self.roots[0].get_qualifying_nodes(min_visits)
+
     def clear(self):
         self.roots[0].clear()
 

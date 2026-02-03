@@ -388,10 +388,17 @@ class BatchWorker_GPU(object):
 
     def _prepare_policy_re(self, policy_re_context):
         """prepare policy targets from the reanalyzed context of policies
+        Returns
+        -------
+        batch_policies_re: np.ndarray or list
+            reanalyzed policy targets
+        subtree_data: dict or None
+            subtree distillation data (hidden states, target policies, weights, sample indices, metadata)
         """
         batch_policies_re = []
+        subtree_data = None
         if policy_re_context is None:
-            return batch_policies_re
+            return batch_policies_re, subtree_data
 
         policy_obs_lst, policy_mask, state_index_lst, indices, child_visits, traj_lens = policy_re_context
         policy_obs_lst = ray.get(policy_obs_lst)
@@ -424,7 +431,7 @@ class BatchWorker_GPU(object):
             noises = [np.random.dirichlet([self.config.root_dirichlet_alpha] * self.config.action_space_size).astype(np.float32).tolist() for _ in range(batch_size)]
             roots.prepare(self.config.root_exploration_fraction, noises, value_prefix_pool, policy_logits_pool)
             # do MCTS for a new policy with the recent target model
-            MCTS(self.config).search(roots, self.model, hidden_state_roots, reward_hidden_roots)
+            hidden_state_pool = MCTS(self.config).search(roots, self.model, hidden_state_roots, reward_hidden_roots)
 
             roots_distributions = roots.get_distributions()
             policy_index = 0
@@ -446,8 +453,54 @@ class BatchWorker_GPU(object):
 
                 batch_policies_re.append(target_policies)
 
+            # --- Subtree distillation: extract qualifying node data ---
+            if self.config.subtree_loss_coeff > 0 and hidden_state_pool is not None:
+                qualifying_nodes = roots.get_qualifying_nodes(self.config.min_visits)
+                unroll_plus_1 = self.config.num_unroll_steps + 1
+
+                st_hidden_states = []
+                st_target_policies = []
+                all_visit_counts = []
+                all_depths = []
+
+                for root_idx, nodes in enumerate(qualifying_nodes):
+                    # Skip out-of-trajectory roots (MCTS ran on zero_obs padding)
+                    if policy_mask[root_idx] == 0:
+                        continue
+
+                    for node_data in nodes:
+                        hsx = node_data[0]  # hidden_state_index_x (simulation step)
+                        hsy = node_data[1]  # hidden_state_index_y (batch position)
+                        visit_count = node_data[2]
+                        depth = node_data[3]
+                        dist = node_data[4:]  # children visit count distribution
+
+                        # Look up hidden state from the pool
+                        hs = hidden_state_pool[hsx][hsy]
+                        st_hidden_states.append(hs)
+
+                        # Normalize visit count distribution to target policy
+                        sum_v = sum(dist)
+                        if sum_v > 0:
+                            target_pol = [v / sum_v for v in dist]
+                        else:
+                            target_pol = [1.0 / len(dist)] * len(dist)
+                        st_target_policies.append(target_pol)
+
+                        all_visit_counts.append(visit_count)
+                        all_depths.append(depth)
+
+                if len(st_hidden_states) > 0:
+                    subtree_data = {
+                        'hidden_states': np.asarray(st_hidden_states),
+                        'target_policies': np.asarray(st_target_policies, dtype=np.float32),
+                        'mean_visits': float(np.mean(all_visit_counts)),
+                        'mean_depth': float(np.mean(all_depths)),
+                        'num_nodes': len(st_hidden_states),
+                    }
+
         batch_policies_re = np.asarray(batch_policies_re)
-        return batch_policies_re
+        return batch_policies_re, subtree_data
 
     def _prepare_policy_non_re(self, policy_non_re_context):
         """prepare policy targets from the non-reanalyzed context of policies
@@ -491,11 +544,11 @@ class BatchWorker_GPU(object):
             # target reward, value
             batch_value_prefixs, batch_values = self._prepare_reward_value(reward_value_context)
             # target policy
-            batch_policies_re = self._prepare_policy_re(policy_re_context)
+            batch_policies_re, subtree_data = self._prepare_policy_re(policy_re_context)
             batch_policies_non_re = self._prepare_policy_non_re(policy_non_re_context)
             batch_policies = np.concatenate([batch_policies_re, batch_policies_non_re])
 
-            targets_batch = [batch_value_prefixs, batch_values, batch_policies]
+            targets_batch = [batch_value_prefixs, batch_values, batch_policies, subtree_data]
             # a batch contains the inputs and the targets; inputs is prepared in CPU workers
             self.batch_storage.push([inputs_batch, targets_batch])
 

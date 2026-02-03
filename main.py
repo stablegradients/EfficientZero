@@ -36,6 +36,8 @@ def build_wandb_group_name(args):
         'use_augmentation': True,
         'augmentation': ['shift', 'intensity'],
         'info': 'none',
+        'subtree_loss_coeff': 0.0,
+        'min_visits': 5,
     }
 
     non_default_params = []
@@ -96,6 +98,12 @@ if __name__ == '__main__':
     parser.add_argument('--load_model', action='store_true', default=False, help='choose to load model')
     parser.add_argument('--model_path', type=str, default='./results/test_model.p', help='load model path')
     parser.add_argument('--object_store_memory', type=int, default=150 * 1024 * 1024 * 1024, help='object store memory')
+
+    # Subtree distillation arguments
+    parser.add_argument('--subtree_loss_coeff', type=float, default=0.0,
+                        help='Weight (lambda) for subtree distillation loss (default: %(default)s, 0 = off)')
+    parser.add_argument('--min_visits', type=int, default=5,
+                        help='Minimum visit count for a qualifying MCTS internal node (default: %(default)s)')
 
     # Wandb arguments
     parser.add_argument('--wandb_entity', type=str, default='stablegradients',

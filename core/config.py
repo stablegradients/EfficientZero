@@ -284,6 +284,10 @@ class BaseConfig(object):
         self.pred_hid = pred_hid
         self.pred_out = pred_out
 
+        # subtree distillation
+        self.subtree_loss_coeff = 0.0   # lambda: weight for subtree policy loss (0 = off)
+        self.min_visits = 5     # qualifying-node visit count threshold
+
     def visit_softmax_temperature_fn(self, num_moves, trained_steps):
         raise NotImplementedError
 
@@ -412,6 +416,10 @@ class BaseConfig(object):
 
         if args.revisit_policy_search_rate is not None:
             self.revisit_policy_search_rate = args.revisit_policy_search_rate
+
+        # subtree distillation
+        self.subtree_loss_coeff = args.subtree_loss_coeff
+        self.min_visits = args.min_visits
 
         localtime = time.asctime(time.localtime(time.time()))
         seed_tag = 'seed={}'.format(self.seed)

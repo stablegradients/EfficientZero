@@ -13,7 +13,9 @@ test_logger = logging.getLogger('train_test')
 def _log(config, step_count, log_data, model, replay_buffer, lr, shared_storage, vis_result, timing_data=None):
     loss_data, td_data, priority_data = log_data
     total_loss, weighted_loss, loss, reg_loss, policy_loss, value_prefix_loss, value_loss, consistency_loss, \
-        grad_norm, policy_entropy, target_policy_entropy = loss_data
+        grad_norm, policy_entropy, target_policy_entropy, \
+        subtree_loss, subtree_grad_norm, subtree_mean_visits, subtree_mean_depth, \
+        subtree_num_nodes, subtree_pred_entropy, subtree_target_entropy = loss_data
     if vis_result:
         new_priority, target_value_prefix, target_value, trans_target_value_prefix, trans_target_value, target_value_prefix_phi, target_value_phi, \
         pred_value_prefix, pred_value, target_policies, predicted_policies, state_lst, other_loss, other_log, other_dist = td_data
@@ -90,6 +92,15 @@ def _log(config, step_count, log_data, model, replay_buffer, lr, shared_storage,
     log_dict['{}/grad_norm'.format(tag)] = grad_norm
     log_dict['{}/policy_entropy'.format(tag)] = policy_entropy
     log_dict['{}/target_policy_entropy'.format(tag)] = target_policy_entropy
+
+    # Subtree distillation metrics
+    log_dict['Subtree/loss'] = subtree_loss
+    log_dict['Subtree/grad_norm'] = subtree_grad_norm
+    log_dict['Subtree/mean_visits'] = subtree_mean_visits
+    log_dict['Subtree/mean_depth'] = subtree_mean_depth
+    log_dict['Subtree/num_nodes'] = subtree_num_nodes
+    log_dict['Subtree/pred_entropy'] = subtree_pred_entropy
+    log_dict['Subtree/target_entropy'] = subtree_target_entropy
 
     # Worker metrics
     if worker_reward is not None:

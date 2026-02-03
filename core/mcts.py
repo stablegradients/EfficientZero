@@ -100,3 +100,5 @@ class MCTS(object):
                 tree.batch_back_propagate(hidden_state_index_x, discount,
                                           value_prefix_pool, value_pool, policy_logits_pool,
                                           min_max_stats_lst, results, is_reset_lst)
+
+            return hidden_state_pool
